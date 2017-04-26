@@ -1,0 +1,210 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import struct
+import argparse
+
+############## INTERNAL VARIABLES ##############
+num_core = 0
+num_skt = 0
+num_core_skt = 0
+available_frequencies = []
+available_governors = []
+default_governor = "ondemand"
+
+############## ARCHITECTURE INFO ##############
+nominal_frequency = None
+
+############## MSR ADDRESSES ##############
+PLATFORM_INFO_ADDR = 0xCE
+IA32_PERF_STATUS = 0x198
+IA32_PERF_CTL = 0x199
+
+##################################################
+
+# Read a MSR registry
+def read_msr(msr, skt=None, core=None):
+    cpu = None
+    if skt is None:
+        cpu = 0
+    elif core is None:
+        cpu = skt * num_core_skt
+    else:
+        cpu = skt * num_core_skt + core
+    f = os.open('/dev/cpu/%d/msr' % (cpu,), os.O_RDONLY)
+    os.lseek(f, msr, os.SEEK_SET)
+    val = struct.unpack('Q', os.read(f, 8))[0]
+    os.close(f)
+    return val
+
+# Write a MSR registry
+def write_msr(msr, val, skt=None, core=None):
+    cpu = None
+    if skt is None:
+        cpu = 0
+    elif core is None:
+        cpu = skt * num_core_skt
+    else:
+        cpu = skt * num_core_skt + core
+    f = os.open('/dev/cpu/%d/msr' % (cpu,), os.O_WRONLY)
+    os.lseek(f, msr, os.SEEK_SET)
+    os.write(f, struct.pack('Q', val))
+    os.close(f)
+
+# Check requisites of the system
+def check_requirements():
+    # Check root permission
+    uid = os.getuid()
+    if uid != 0:
+        sys.stderr.write("[WARNING] Need to be root to execute this software!\n")
+        exit(-1)
+
+    # Check if MSR module is loaded
+    if not os.path.exists("/dev/cpu/0/msr"):
+        sys.stderr.write("[WARNING] MSR module is not loaded!\n")
+        exit(-2)
+
+    # Check if power manager driver is "acpi-cpufreq"
+    with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver", "r") as f:
+        scaling_driver = f.readline().rstrip()
+        if scaling_driver != "acpi-cpufreq":
+            sys.stderr.write("[ERROR] Current power manager driver is " + scaling_driver + ", only acpi-cpufreq driver is currently supported!\n")
+            exit(-3)
+
+    # Check if this version of acpi-cpufreq support "userspace" governor
+    with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors", "r") as f:
+        scaling_available_governors = f.readline().rstrip()
+        if "userspace" not in scaling_available_governors:
+            sys.stderr.write("[ERROR] This version of cpufreq driver doesn't support userspace governor!\n")
+            exit(-4)
+
+# Default initial configuration
+def init_config():
+    global num_core, num_skt, num_core_skt, available_frequencies, available_governors, nominal_frequency
+
+    # Read the number of virtual CPUs and sockets
+    with open("/proc/cpuinfo", "r") as f:
+        conf_lines = f.readlines()
+        for cl in conf_lines:
+            if "physical id" in cl:
+                num_core += 1
+                skt = cl.replace(" ", "").split(":")[1]
+                if (int(skt)+1) > num_skt:
+                    num_skt += 1
+    num_core_skt = num_core / num_skt
+
+    # Read all available frequencies
+    with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies", "r") as f:
+        available_frequencies = f.readline().rstrip().split(" ")
+    available_frequencies = [int(float(f)/1000) for f in available_frequencies]
+
+    # Read all available governors
+    with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors", "r") as f:
+        available_governors = f.readline().rstrip().split(" ")
+
+    # Read nominal CPU frequency
+    platform_info = read_msr(PLATFORM_INFO_ADDR)
+    nominal_frequency = ((platform_info >> 0x8) & 0xFF) * 100.0
+
+def read_freq(core=None):
+    if core is None:
+	freq = []
+        for c in range(num_core):
+            freq.append(read_freq(c))
+        return freq
+    else:
+    	freq = None
+    	with open("/sys/devices/system/cpu/cpu" + str(core) + "/cpufreq/scaling_setspeed", "r") as f:
+            freq = int(float(f.readline().rstrip()) / 1000)
+        return freq
+
+def set_freq(freq, core=None):
+    if freq not in available_frequencies:
+        print "[ERROR] Frequency " + str(freq) + " MHz is not supported!"
+    if core is None:
+        for c in range(num_core):
+            set_freq(freq, c)
+    else:
+    	with open("/sys/devices/system/cpu/cpu" + str(core) + "/cpufreq/scaling_setspeed", "w") as f:
+    		f.write(str(int(freq*1000)))
+
+def read_gov(core=None):
+    if core is None:
+        gov = []
+        for c in range(num_core):
+            gov.append(read_gov(c))
+        return gov
+    else:
+    	gov = None
+    	with open("/sys/devices/system/cpu/cpu" + str(core) + "/cpufreq/scaling_governor", "r") as f:
+            gov = f.readline().rstrip()
+        return gov
+
+def set_gov(gov, core=None):
+    if gov not in available_governors:
+        print "[ERROR] Governor " + str(gov) + " is not supported!"
+        sys.exit()
+    if core is None:
+        for c in range(num_core):
+            set_gov(gov, c)
+    else:
+    	with open("/sys/devices/system/cpu/cpu" + str(core) + "/cpufreq/scaling_governor", "w") as f:
+    	    f.write(gov)
+
+if __name__ == "__main__":
+    check_requirements()
+
+    init_config()
+
+    govs = [None] * num_core
+    freqs = [None] * num_core
+
+    parser = argparse.ArgumentParser(description='Tool for RAPL setting')
+    parser.add_argument('-c','--core', help='Set frequency for core $C', required=False, type=int)
+    parser.add_argument('-g','--governor', help='Set governor for core $C', required=False)
+    parser.add_argument('-f','--freq', help='Frequency value in MHz', required=False, type=int)
+    parser.add_argument('-r','--reset-all', help='Reset governor and frequency for all cores (default: ondemand, turbo)', required=False, action='store_true', default=False)
+    parser.add_argument('-rg','--reset-gov', help='Reset governor for all cores (default: ondemand)', required=False, action='store_true', default=False)
+    parser.add_argument('-rf','--reset-freq', help='Reset frequency for all cores (default: turbo)', required=False, action='store_true', default=False)
+
+    args = parser.parse_args()
+
+    if len(sys.argv) == 1:
+        for c in range(num_core):
+       	    curr_governor = read_gov(c)
+            if curr_governor in "userspace":
+                freq = read_freq(c)
+                print "Core " + str(c) + " - governor: " + str(curr_governor) + " - frequency: " + str(freq) + " MHz"
+            else:
+                print "Core " + str(c) + " - governor: " + str(curr_governor)
+    else:
+    	if args.reset_all is True:
+    		govs = [default_governor] * num_core
+    		freqs = [available_frequencies[0]] * num_core
+        elif args.reset_gov is True:
+            govs = [default_governor] * num_core
+        elif args.reset_freq is True:
+            freqs = [available_frequencies[0]] * num_core
+        else:
+            if args.core is not None:
+                if args.governor is not None:
+                    govs[args.core] = args.governor
+                if args.freq is not None:
+                    govs[args.core] = "userspace"
+                    freqs[args.core] = args.freq
+            else:
+	        # Governor
+	        if args.governor is not None:
+	            govs = [args.governor] * num_core
+	        # Frequency
+    		if args.freq is not None:
+    		    govs = ["userspace"] * num_core
+    		    freqs = [args.freq] * num_core
+
+    for c in range(num_core):
+    	if govs[c] is not None:
+            set_gov(govs[c], c)
+        curr_gov = read_gov(c)
+        if curr_gov in "userspace" and freqs[c] is not None:
+            set_freq(freqs[c], c)
